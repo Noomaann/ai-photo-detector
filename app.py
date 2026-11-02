@@ -83,31 +83,16 @@ class HybridModel(nn.Module):
     return self.head(f)
 
 
-# ===== Load Model with Debugging & Safe Loading =====
+# ===== Load Model =====
 @st.cache_resource
 def load_trained_model():
   dev = torch.device('cpu')
   model = HybridModel(ARCH, n_cls=len(CLS), pre=False)
 
-  if not os.path.exists(MODEL_PATH):
-    st.error(
-        f"❌ '{MODEL_PATH}' ফাইলটি পাওয়া যায়নি! ফাইলটি কি সঠিক ফোল্ডারে আছে?"
-    )
-    return model
+  if os.path.exists(MODEL_PATH):
+    weights = torch.load(MODEL_PATH, map_location=dev)
 
-  # ওয়েটস লোড করা
-  weights = torch.load(MODEL_PATH, map_location=dev)
-
-  with st.expander('🔍 Model Loading Diagnostics (ডিবাগ তথ্য)', expanded=True):
-    st.write(f'**Checkpoint Type:** `{type(weights)}`')
-
-    # ডিকশনারির ভেতরের কি চেক
     if isinstance(weights, dict):
-      st.write(
-          '**Top Keys in Checkpoint:**',
-          [str(k) for k in list(weights.keys())[:10]],
-      )
-
       if 'model_state_dict' in weights:
         weights = weights['model_state_dict']
       elif 'state_dict' in weights:
@@ -117,23 +102,8 @@ def load_trained_model():
       elif 'net' in weights:
         weights = weights['net']
 
-    # 'module.' প্রিফিক্স রিমুভ করা
     cleaned = {str(k).replace('module.', ''): v for k, v in weights.items()}
-
-    # মডেলের স্টেট ডিকশনারি লোড করা
-    load_result = model.load_state_dict(cleaned, strict=False)
-
-    missing_cnt = len(load_result.missing_keys)
-    unexpected_cnt = len(load_result.unexpected_keys)
-
-    if missing_cnt == 0:
-      st.success('✅ সব লেয়ার সফলভাবে লোড হয়েছে! (Missing Keys: 0)')
-    else:
-      st.error(f'⚠️ Warning: {missing_cnt} টি লেয়ার লোড হয়নি (Missing Keys)!')
-      st.write('কিছু মিসিং লেয়ারের নাম:', load_result.missing_keys[:5])
-
-    if unexpected_cnt > 0:
-      st.info(f'অতিরিক্ত কি (Unexpected Keys): {unexpected_cnt} টি')
+    model.load_state_dict(cleaned, strict=False)
 
   model.to(dev)
   model.eval()
