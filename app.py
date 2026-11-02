@@ -1,10 +1,10 @@
+import os
+from PIL import Image
 import streamlit as st
+import timm
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from PIL import Image
-import timm
-import os
 
 # ===== Model Configuration =====
 ARCH = 'convnext_small.fb_in22k'
@@ -12,127 +12,170 @@ CLS = ['ai_edited', 'fully_ai', 'real']
 SZ = 256
 MODEL_PATH = 'best_model.pth'
 
+
 # ===== Architecture =====
 class FreqBlock(nn.Module):
-    def __init__(self, out_c=256):
-        super().__init__()
-        self.srm = nn.Conv2d(3, 12, 3, padding=1, bias=False)
-        nn.init.kaiming_normal_(self.srm.weight)
 
-        self.net = nn.Sequential(
-            nn.Conv2d(18, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, out_c, 3, stride=2, padding=1),
-            nn.BatchNorm2d(out_c),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
-        )
+  def __init__(self, out_c=256):
+    super().__init__()
+    self.srm = nn.Conv2d(3, 12, 3, padding=1, bias=False)
+    nn.init.kaiming_normal_(self.srm.weight)
 
-    def forward(self, x):
-        xf = x.float()
-        ft = torch.fft.fftshift(torch.fft.fft2(xf, norm='ortho'))
-        amp = torch.log(torch.abs(ft) + 1e-6)
-        ph = torch.angle(ft)
-        amp = (amp - amp.mean(dim=(-2, -1), keepdim=True)) / (amp.std(dim=(-2, -1), keepdim=True) + 1e-6)
-        ph = ph / 3.141592653589793
+    self.net = nn.Sequential(
+        nn.Conv2d(18, 64, 3, stride=2, padding=1),
+        nn.BatchNorm2d(64),
+        nn.GELU(),
+        nn.Conv2d(64, 128, 3, stride=2, padding=1),
+        nn.BatchNorm2d(128),
+        nn.GELU(),
+        nn.Conv2d(128, out_c, 3, stride=2, padding=1),
+        nn.BatchNorm2d(out_c),
+        nn.GELU(),
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+    )
 
-        s = self.srm(x)
-        cat = torch.cat([s, amp.to(x.dtype), ph.to(x.dtype)], dim=1)
-        return self.net(cat)
+  def forward(self, x):
+    xf = x.float()
+    ft = torch.fft.fftshift(torch.fft.fft2(xf, norm='ortho'))
+    amp = torch.log(torch.abs(ft) + 1e-6)
+    ph = torch.angle(ft)
+    amp = (amp - amp.mean(dim=(-2, -1), keepdim=True)) / (
+        amp.std(dim=(-2, -1), keepdim=True) + 1e-6
+    )
+    ph = ph / 3.141592653589793
+
+    s = self.srm(x)
+    cat = torch.cat([s, amp.to(x.dtype), ph.to(x.dtype)], dim=1)
+    return self.net(cat)
+
 
 class HybridModel(nn.Module):
-    def __init__(self, arch=ARCH, n_cls=3, pre=False):
-        super().__init__()
-        self.base = timm.create_model(arch, pretrained=pre, num_classes=0)
-        dim1 = self.base.num_features
-        dim2 = 256
-        self.freq = FreqBlock(dim2)
-        tot = dim1 + dim2
 
-        self.gate = nn.Sequential(
-            nn.Linear(tot, tot // 4),
-            nn.GELU(),
-            nn.Linear(tot // 4, tot),
-            nn.Sigmoid()
-        )
-        self.head = nn.Sequential(
-            nn.LayerNorm(tot),
-            nn.Dropout(0.3),
-            nn.Linear(tot, 512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, n_cls)
-        )
+  def __init__(self, arch=ARCH, n_cls=3, pre=False):
+    super().__init__()
+    self.base = timm.create_model(arch, pretrained=pre, num_classes=0)
+    dim1 = self.base.num_features
+    dim2 = 256
+    self.freq = FreqBlock(dim2)
+    tot = dim1 + dim2
 
-    def forward(self, x):
-        f1 = self.base(x)
-        f2 = self.freq(x)
-        f = torch.cat([f1, f2], dim=1)
-        f = f * self.gate(f)
-        return self.head(f)
+    self.gate = nn.Sequential(
+        nn.Linear(tot, tot // 4),
+        nn.GELU(),
+        nn.Linear(tot // 4, tot),
+        nn.Sigmoid(),
+    )
+    self.head = nn.Sequential(
+        nn.LayerNorm(tot),
+        nn.Dropout(0.3),
+        nn.Linear(tot, 512),
+        nn.GELU(),
+        nn.Dropout(0.2),
+        nn.Linear(512, n_cls),
+    )
 
-# ===== Load Model with Automatic Unwrapping & Safe Loading =====
+  def forward(self, x):
+    f1 = self.base(x)
+    f2 = self.freq(x)
+    f = torch.cat([f1, f2], dim=1)
+    f = f * self.gate(f)
+    return self.head(f)
+
+
+# ===== Load Model with Debugging & Safe Loading =====
 @st.cache_resource
 def load_trained_model():
-    dev = torch.device('cpu')
-    model = HybridModel(ARCH, n_cls=len(CLS), pre=False)
-    
-    if os.path.exists(MODEL_PATH):
-        weights = torch.load(MODEL_PATH, map_location=dev)
-        
-        # ১. যদি ফাইলটি ডিকশনারির ভেতরে সেভ করা থাকে (যেমন model_state_dict বা state_dict)
-        if isinstance(weights, dict):
-            if 'model_state_dict' in weights:
-                weights = weights['model_state_dict']
-            elif 'state_dict' in weights:
-                weights = weights['state_dict']
+  dev = torch.device('cpu')
+  model = HybridModel(ARCH, n_cls=len(CLS), pre=False)
 
-        # ২. DataParallel-এর 'module.' প্রিফিক্স রিমুভ করা
-        cleaned = {k.replace('module.', ''): v for k, v in weights.items()}
-        
-        # ৩. strict=False দিয়ে সেফ লোড যাতে অপ্রয়োজনীয় বাফারের কারণে ক্র্যাশ না করে
-        model.load_state_dict(cleaned, strict=False)
-    
-    model.to(dev)
-    model.eval()
+  if not os.path.exists(MODEL_PATH):
+    st.error(
+        f"❌ '{MODEL_PATH}' ফাইলটি পাওয়া যায়নি! ফাইলটি কি সঠিক ফোল্ডারে আছে?"
+    )
     return model
+
+  # ওয়েটস লোড করা
+  weights = torch.load(MODEL_PATH, map_location=dev)
+
+  with st.expander('🔍 Model Loading Diagnostics (ডিবাগ তথ্য)', expanded=True):
+    st.write(f'**Checkpoint Type:** `{type(weights)}`')
+
+    # ডিকশনারির ভেতরের কি চেক
+    if isinstance(weights, dict):
+      st.write(
+          '**Top Keys in Checkpoint:**',
+          [str(k) for k in list(weights.keys())[:10]],
+      )
+
+      if 'model_state_dict' in weights:
+        weights = weights['model_state_dict']
+      elif 'state_dict' in weights:
+        weights = weights['state_dict']
+      elif 'model' in weights:
+        weights = weights['model']
+      elif 'net' in weights:
+        weights = weights['net']
+
+    # 'module.' প্রিফিক্স রিমুভ করা
+    cleaned = {str(k).replace('module.', ''): v for k, v in weights.items()}
+
+    # মডেলের স্টেট ডিকশনারি লোড করা
+    load_result = model.load_state_dict(cleaned, strict=False)
+
+    missing_cnt = len(load_result.missing_keys)
+    unexpected_cnt = len(load_result.unexpected_keys)
+
+    if missing_cnt == 0:
+      st.success('✅ সব লেয়ার সফলভাবে লোড হয়েছে! (Missing Keys: 0)')
+    else:
+      st.error(f'⚠️ Warning: {missing_cnt} টি লেয়ার লোড হয়নি (Missing Keys)!')
+      st.write('কিছু মিসিং লেয়ারের নাম:', load_result.missing_keys[:5])
+
+    if unexpected_cnt > 0:
+      st.info(f'অতিরিক্ত কি (Unexpected Keys): {unexpected_cnt} টি')
+
+  model.to(dev)
+  model.eval()
+  return model
+
 
 # ===== Preprocessing =====
 val_tf = transforms.Compose([
     transforms.Resize((SZ, SZ)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
 # ===== Streamlit UI =====
-st.set_page_config(page_title="AI Photo Detector", page_icon="🔍")
-st.title("🔍 AI vs Real Picture Detector")
-st.write("Upload a picture to check whether it is **Real**, **AI Edited**, or **Fully AI Generated**.")
+st.set_page_config(page_title='AI Photo Detector', page_icon='🔍')
+st.title('🔍 AI vs Real Picture Detector')
+st.write(
+    'Upload a picture to check whether it is **Real**, **AI Edited**, or'
+    ' **Fully AI Generated**.'
+)
 
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "webp"])
+uploaded_file = st.file_uploader(
+    'Choose an image...', type=['jpg', 'jpeg', 'png', 'webp']
+)
 
 if uploaded_file is not None:
-    img = Image.open(uploaded_file).convert("RGB")
-    st.image(img, caption="Uploaded Image", use_container_width=True)
+  img = Image.open(uploaded_file).convert('RGB')
+  st.image(img, caption='Uploaded Image', use_container_width=True)
 
-    with st.spinner("Analyzing image..."):
-        model = load_trained_model()
-        inp = val_tf(img).unsqueeze(0)
-        with torch.no_grad():
-            out = model(inp)
-            probs = torch.softmax(out, dim=1).squeeze(0)
+  with st.spinner('Analyzing image...'):
+    model = load_trained_model()
+    inp = val_tf(img).unsqueeze(0)
+    with torch.no_grad():
+      out = model(inp)
+      probs = torch.softmax(out, dim=1).squeeze(0)
 
-        preds = {CLS[i]: float(probs[i]) for i in range(len(CLS))}
-        best_cls = max(preds, key=preds.get)
+    preds = {CLS[i]: float(probs[i]) for i in range(len(CLS))}
+    best_cls = max(preds, key=preds.get)
 
-    st.subheader(f"Prediction: **{best_cls.upper()}** ({preds[best_cls]*100:.2f}%)")
-    
-    st.write("Confidence Breakdown:")
-    for c, p in preds.items():
-        st.write(f"- **{c}**: {p*100:.2f}%")
-        st.progress(p)
+  st.subheader(f'Prediction: **{best_cls.upper()}** ({preds[best_cls]*100:.2f}%)')
+
+  st.write('Confidence Breakdown:')
+  for c, p in preds.items():
+    st.write(f'- **{c}**: {p*100:.2f}%')
+    st.progress(p)
